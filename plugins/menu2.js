@@ -1,4 +1,4 @@
-// plugins/menu.js - ESM Version (List Selector)
+// plugins/menu.js - ESM Version (List Selector - Fixed)
 import { fileURLToPath } from 'url';
 import path from 'path';
 import config from '../config.js';
@@ -42,11 +42,12 @@ const getMediaType = (url) => {
 
 const resolveMedia = async () => {
     const localImage = path.join(__dirname, '../lib/khanmd.jpg');
-    const mt = getMediaType(config.BOT_MEDIA_URL);
+    const url = config.BOT_IMAGE || config.BOT_MEDIA_URL;
+    const mt = getMediaType(url);
     if (mt === 'image' || mt === 'video') {
         try {
-            await axios.head(config.BOT_MEDIA_URL, { timeout: 3000 });
-            return { [mt]: { url: config.BOT_MEDIA_URL } };
+            await axios.head(url, { timeout: 3000 });
+            return { [mt]: { url } };
         } catch {
             return { image: { url: localImage } };
         }
@@ -68,7 +69,7 @@ const getCategorized = () => {
 };
 
 // ===============================
-// MENU — List Selector
+// MENU — List Selector (Fixed)
 // ===============================
 cmd({
     pattern: "menux",
@@ -84,11 +85,9 @@ cmd({
         const { categorized, totalCommands } = getCategorized();
         const categories = Object.keys(categorized);
 
-        const btn = new Button(conn);
-        btn
-            .setTitle(`${config.BOT_NAME}`)
-            .setSubtitle('ᴄᴏᴍᴍᴀɴᴅ ᴄᴇɴᴛᴇʀ')
-            .setBody(
+        // 1️⃣ Send header image + info text
+        const media = await resolveMedia();
+        const headerText =
 `*╭┈───〔 ${config.BOT_NAME} 〕┈───⊷*
 *├▢ Owner:* ${config.OWNER_NAME}
 *├▢ Prefix:* ${config.PREFIX}
@@ -97,88 +96,153 @@ cmd({
 *├▢ Runtime:* ${runtime(process.uptime())}
 *╰───────────────────⊷*
 
-*ᴛᴀᴘ ʙᴇʟᴏᴡ ᴛᴏ ᴏᴘᴇɴ ᴄᴀᴛᴇɢᴏʀʏ ʟɪsᴛ 📂*`
-            )
+*ᴛᴀᴘ ʙᴇʟᴏᴡ ᴛᴏ ᴏᴘᴇɴ ᴄᴀᴛᴇɢᴏʀʏ ʟɪsᴛ 📂*`;
+
+        const headerMsg = await conn.sendMessage(from, {
+            ...media,
+            caption: headerText
+        }, { quoted: mek });
+
+        const headerId = headerMsg.key.id;
+
+        // 2️⃣ Send the button/list message
+        const btn = new Button(conn);
+        btn
+            .setTitle(`${config.BOT_NAME}`)
+            .setSubtitle('ᴄᴏᴍᴍᴀɴᴅ ᴄᴇɴᴛᴇʀ')
+            .setBody('*📂 sᴇʟᴇᴄᴛ ᴀ ᴄᴀᴛᴇɢᴏʀʏ ʙᴇʟᴏᴡ*')
             .setFooter('> ᴘᴏᴡᴇʀᴇᴅ ʙʏ ᴊᴀᴡᴀᴅᴛᴇᴄʜx');
 
-        if (config.BOT_MEDIA_URL && getMediaType(config.BOT_MEDIA_URL) === 'image') {
-            btn.setImage(config.BOT_MEDIA_URL);
-        }
-
-        // Single "Open Menu" dropdown
+        // ⬇️ SINGLE "Open Menu" selector
         btn.addSelection('📂 Open Menu');
 
-        const perSection = 10;
-        for (let i = 0; i < categories.length; i += perSection) {
-            const chunk = categories.slice(i, i + perSection);
-            const pageNum = Math.floor(i / perSection) + 1;
-            btn.makeSection(`📁 Page ${pageNum}`);
-            for (const cat of chunk) {
-                const count = categorized[cat].length;
-                btn.makeRow('📌', cat.toUpperCase(), `${count} commands available`, `menu_${cat}`);
-            }
+        // ✅ ONLY 1 PAGE — put all categories in one section
+        btn.makeSection('📁 Categories');
+        for (const cat of categories) {
+            const count = categorized[cat].length;
+            btn.makeRow(
+                '📌',
+                cat.toUpperCase(),
+                `${count} commands available`,
+                `menu_${cat}`
+            );
         }
 
+        // Quick reply shortcuts
         btn.addReply('📜 Full Menu', 'menu_full');
         btn.addReply('🏓 Ping', 'menu_ping');
 
-        await btn.send(from, { quoted: mek });
+        const sentBtn = await btn.send(from, { quoted: mek });
+        const buttonId = sentBtn.key.id;
 
-        // Listener
+        // 3️⃣ Listener — match EITHER header msg OR button msg
         const listener = async (msgData) => {
             const msg = msgData.messages[0];
             if (!msg?.message) return;
 
-            const tappedId =
+            // Only listen in this chat
+            if (msg.key.remoteJid !== from) return;
+
+            // Extract context info (for reply-to detection)
+            const ctx =
+                msg.message?.extendedTextMessage?.contextInfo ||
+                msg.message?.listResponseMessage?.contextInfo ||
+                msg.message?.buttonsResponseMessage?.contextInfo ||
+                msg.message?.interactiveResponseMessage?.contextInfo;
+
+            const stanzaId = ctx?.stanzaId;
+
+            // Only handle if it's a reply to OUR header or button message
+            const isReplyToOurs = stanzaId === headerId || stanzaId === buttonId;
+
+            // Extract selection ID
+            let tappedId =
                 msg.message?.listResponseMessage?.singleSelectReply?.selectedRowId ||
                 msg.message?.buttonsResponseMessage?.selectedButtonId ||
                 msg.message?.interactiveResponseMessage?.nativeFlowResponseMessage?.paramsJson ||
-                msg.message?.conversation;
+                msg.message?.conversation ||
+                msg.message?.extendedTextMessage?.text;
 
-            if (!tappedId) return;
-
-            let id = tappedId;
-            if (typeof id === 'string' && id.startsWith('{')) {
-                try { id = JSON.parse(id).id || tappedId; } catch {}
+            // Handle JSON-wrapped params
+            if (typeof tappedId === 'string' && tappedId.startsWith('{')) {
+                try { tappedId = JSON.parse(tappedId).id || tappedId; } catch {}
             }
 
-            if (!id.startsWith('menu_')) return;
+            // Only handle taps that start with menu_ OR came from our message
+            const isMenuTap = typeof tappedId === 'string' && tappedId.startsWith('menu_');
+            if (!isMenuTap && !isReplyToOurs) return;
 
+            // Remove listener on first valid interaction
             conn.ev.off('messages.upsert', listener);
 
-            if (id === 'menu_full') {
-                await conn.sendMessage(msg.key.remoteJid, { text: `*ᴜsᴇ ${config.PREFIX}ᴍᴇɴᴜ2*` }, { quoted: msg });
+            try {
+                await conn.sendMessage(from, { react: { text: '⬇️', key: msg.key } });
+            } catch {}
+
+            // Quick replies
+            if (tappedId === 'menu_full') {
+                await conn.sendMessage(from, { text: `*ᴜsᴇ ${config.PREFIX}ᴍᴇɴᴜ2*` }, { quoted: msg });
                 return;
             }
-            if (id === 'menu_ping') {
-                await conn.sendMessage(msg.key.remoteJid, { text: '🏓 Pong!' }, { quoted: msg });
+            if (tappedId === 'menu_ping') {
+                await conn.sendMessage(from, { text: '🏓 Pong!' }, { quoted: msg });
                 return;
             }
 
-            const cat = id.replace('menu_', '');
-            const cmds = categorized[cat];
-            if (!cmds) {
-                await conn.sendMessage(msg.key.remoteJid, { text: '❌ Unknown category' }, { quoted: msg });
+            // Category selected
+            if (isMenuTap) {
+                const cat = tappedId.replace('menu_', '');
+                const cmds = categorized[cat];
+                if (!cmds) {
+                    await conn.sendMessage(from, { text: '❌ Unknown category' }, { quoted: msg });
+                    return;
+                }
+
+                const displayName = cat.charAt(0).toUpperCase() + cat.slice(1);
+                let catMenu = `*╭┈───〔 ${displayName} Menu 〕┈───⊷*\n`;
+                catMenu += `*├▢ 📜 Category:* ${cat}\n`;
+                catMenu += `*├▢ 🔢 Commands:* ${cmds.length}\n`;
+                catMenu += `*╰───────────────────⊷*`;
+                catMenu += formatCategory(cat, cmds);
+                catMenu += `\n\n> *ᴜsᴇ ${config.PREFIX}ᴍᴇɴᴜ ᴛᴏ ɢᴏ ʙᴀᴄᴋ*`;
+
+                const catMedia = await resolveMedia();
+                await conn.sendMessage(from, {
+                    ...catMedia,
+                    caption: catMenu
+                }, { quoted: msg });
                 return;
             }
 
-            const displayName = cat.charAt(0).toUpperCase() + cat.slice(1);
-            let catMenu = `*╭┈───〔 ${displayName} Menu 〕┈───⊷*\n`;
-            catMenu += `*├▢ 📜 Category:* ${cat}\n`;
-            catMenu += `*├▢ 🔢 Commands:* ${cmds.length}\n`;
-            catMenu += `*╰───────────────────⊷*`;
-            catMenu += formatCategory(cat, cmds);
-            catMenu += `\n\n> *ᴜsᴇ ${config.PREFIX}ᴍᴇɴᴜ ᴛᴏ ɢᴏ ʙᴀᴄᴋ*`;
+            // Reply-with-number fallback (for users who reply to the header)
+            if (isReplyToOurs) {
+                const num = parseInt(tappedId);
+                if (num >= 1 && num <= categories.length) {
+                    const cat = categories[num - 1];
+                    const cmds = categorized[cat];
+                    const displayName = cat.charAt(0).toUpperCase() + cat.slice(1);
+                    let catMenu = `*╭┈───〔 ${displayName} Menu 〕┈───⊷*\n`;
+                    catMenu += `*├▢ 📜 Category:* ${cat}\n`;
+                    catMenu += `*├▢ 🔢 Commands:* ${cmds.length}\n`;
+                    catMenu += `*╰───────────────────⊷*`;
+                    catMenu += formatCategory(cat, cmds);
+                    catMenu += `\n\n> *ᴜsᴇ ${config.PREFIX}ᴍᴇɴᴜ ᴛᴏ ɢᴏ ʙᴀᴄᴋ*`;
 
-            const catMedia = await resolveMedia();
-            await conn.sendMessage(msg.key.remoteJid, {
-                ...catMedia,
-                caption: catMenu
-            }, { quoted: msg });
+                    const catMedia = await resolveMedia();
+                    await conn.sendMessage(from, {
+                        ...catMedia,
+                        caption: catMenu
+                    }, { quoted: msg });
+                }
+            }
         };
 
         conn.ev.on('messages.upsert', listener);
-        setTimeout(() => conn.ev.off('messages.upsert', listener), 120000);
+
+        // Auto cleanup after 120s
+        setTimeout(() => {
+            conn.ev.off('messages.upsert', listener);
+        }, 120000);
 
     } catch (e) {
         console.error(e);
