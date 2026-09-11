@@ -1,4 +1,4 @@
-// plugins/menu.js - ESM Version (Single Message + Multi-Select)
+// plugins/menu.js - ESM Version (Single Message + Multi-Select + Direct Command Exec)
 import { fileURLToPath } from 'url';
 import path from 'path';
 import config from '../config.js';
@@ -10,6 +10,7 @@ import { Button } from '../lib/mb.js';
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
+// ========== SMALL CAPS ==========
 const toSmallCaps = (text) => {
     if (!text || typeof text !== 'string') return '';
     const map = {
@@ -23,6 +24,7 @@ const toSmallCaps = (text) => {
     return text.split('').map(c => map[c] || c).join('');
 };
 
+// ========== FORMAT CATEGORY ==========
 const formatCategory = (category, cmds) => {
     const valid = cmds.filter(c => c.pattern && c.pattern.trim() !== '');
     if (!valid.length) return '';
@@ -31,6 +33,7 @@ const formatCategory = (category, cmds) => {
     return `${title}${body}\n╰───────────────────⊷`;
 };
 
+// ========== MEDIA HELPERS ==========
 const getMediaType = (url) => {
     if (!url || typeof url !== 'string' || !url.trim()) return null;
     const l = url.toLowerCase();
@@ -43,6 +46,7 @@ const getImageUrl = () => {
     return config.BOT_IMAGE || config.BOT_MEDIA_URL || path.join(__dirname, '../lib/khanmd.jpg');
 };
 
+// ========== CATEGORIZED COMMANDS ==========
 const getCategorized = () => {
     const arr = Array.isArray(commands) ? commands : Object.values(commands);
     const categories = [...new Set(arr.map(c => c.category))]
@@ -54,6 +58,50 @@ const getCategorized = () => {
         if (v.length > 0) categorized[cat] = v;
     });
     return { categorized, totalCommands: arr.length };
+};
+
+// ========== FIND COMMAND BY PATTERN ==========
+const findCommand = (pattern) => {
+    const arr = Array.isArray(commands) ? commands : Object.values(commands);
+    return arr.find(c => c.pattern === pattern)
+        || arr.find(c => c.alias && c.alias.includes(pattern));
+};
+
+// ========== EXECUTE COMMAND DIRECTLY ==========
+const execCommand = async (conn, msg, from, commandObj) => {
+    if (!commandObj) return false;
+
+    // Support both .function and .handler property names
+    const handler = commandObj.function || commandObj.handler || commandObj.execute;
+    if (!handler) return false;
+
+    const fakeMek = { ...msg };
+    const fakeM = {
+        chat: from,
+        sender: msg.key.participant || msg.key.remoteJid,
+        isGroup: from.endsWith('@g.us'),
+        mentionedJid: [],
+        quoted: null,
+        text: '',
+    };
+
+    const fakeArgs = {
+        from,
+        sender: fakeM.sender,
+        reply: (t) => conn.sendMessage(from, { text: t }, { quoted: msg }),
+        args: [],
+        q: '',
+        react: async (e) => conn.sendMessage(from, { react: { text: e, key: msg.key } }),
+    };
+
+    try {
+        await handler(conn, fakeMek, fakeM, fakeArgs);
+        return true;
+    } catch (err) {
+        console.error(`exec ${commandObj.pattern} error:`, err);
+        await conn.sendMessage(from, { text: `❌ ${commandObj.pattern} error: ${err.message}` }, { quoted: msg });
+        return false;
+    }
 };
 
 // ===============================
@@ -72,15 +120,15 @@ cmd({
 
         const { categorized, totalCommands } = getCategorized();
         const categories = Object.keys(categorized);
+        const imageUrl = getImageUrl();
 
         // Build the single combined message
         const btn = new Button(conn);
 
-        // Header image (embedded in message header, not separate)
-        const imageUrl = getImageUrl();
+        // Header image
         btn.setImage(imageUrl);
 
-        // Info + title + subtitle
+        // Title + subtitle + body
         btn
             .setTitle(`${config.BOT_NAME}`)
             .setSubtitle('ᴄᴏᴍᴍᴀɴᴅ ᴄᴇɴᴛᴇʀ')
@@ -93,14 +141,14 @@ cmd({
 *├▢ Runtime:* ${runtime(process.uptime())}
 *╰───────────────────⊷*
 
-*ᴛᴀᴘ ʙᴇʟᴏᴡ ᴛᴏ ᴏᴘᴇɴ ᴄᴀᴛᴇɢᴏʀʏ ʟɪsᴛ 📂*`
+*ᴛᴀᴘ ʙᴇʟᴏᴡ ᴛᴏ ᴏᴘᴇɴ ᴄᴀᴛᴇɢᴏʀʏ ʟɪsᴛ*`
             )
             .setFooter('> ᴘᴏᴡᴇʀᴇᴅ ʙʏ ᴊᴀᴡᴀᴅᴛᴇᴄʜx');
 
-        // Single "Open Menu" dropdown
+        // Single "Open Menu" selector
         btn.addSelection('📂 Open Menu');
 
-        // All categories in ONE section
+        // One section — all categories
         btn.makeSection('📁 Categories');
         for (const cat of categories) {
             const count = categorized[cat].length;
@@ -111,21 +159,19 @@ cmd({
         btn.addReply('📜 Full Menu', 'menu_full');
         btn.addReply('🏓 Ping', 'menu_ping');
 
-        // SEND — single message
+        // Send single message
         const sentMsg = await btn.send(from, { quoted: mek });
         const messageId = sentMsg.key.id;
 
         // ============================================
-        // LISTENER — multi-select, 60s cleanup
+        // LISTENER — multi-select + direct command exec
         // ============================================
         const listener = async (msgData) => {
             const msg = msgData.messages[0];
             if (!msg?.message) return;
 
-            // Must be in the same chat
             if (msg.key.remoteJid !== from) return;
 
-            // Extract context
             const ctx =
                 msg.message?.extendedTextMessage?.contextInfo ||
                 msg.message?.listResponseMessage?.contextInfo ||
@@ -134,7 +180,6 @@ cmd({
 
             const stanzaId = ctx?.stanzaId;
 
-            // Extract selection ID
             let tappedId =
                 msg.message?.listResponseMessage?.singleSelectReply?.selectedRowId ||
                 msg.message?.buttonsResponseMessage?.selectedButtonId ||
@@ -149,26 +194,33 @@ cmd({
             const isReplyToOurs = stanzaId === messageId;
             const isMenuTap = typeof tappedId === 'string' && tappedId.startsWith('menu_');
 
-            // Ignore unrelated messages (DON'T remove listener — multi-select)
             if (!isMenuTap && !isReplyToOurs) return;
 
             try {
                 await conn.sendMessage(from, { react: { text: '⬇️', key: msg.key } });
             } catch {}
 
-            // Full menu
+            // ========== FULL MENU → execute menu2 ==========
             if (tappedId === 'menu_full') {
-                await conn.sendMessage(from, { text: `*ᴜsᴇ ${config.PREFIX}ᴍᴇɴᴜ2*` }, { quoted: msg });
+                const menu2Cmd = findCommand('menu2');
+                const ok = await execCommand(conn, msg, from, menu2Cmd);
+                if (!ok) {
+                    await conn.sendMessage(from, { text: `*ᴜsᴇ ${config.PREFIX}ᴍᴇɴᴜ2*` }, { quoted: msg });
+                }
                 return;
             }
 
-            // Ping
+            // ========== PING → execute ping ==========
             if (tappedId === 'menu_ping') {
-                await conn.sendMessage(from, { text: '🏓 Pong!' }, { quoted: msg });
+                const pingCmd = findCommand('ping');
+                const ok = await execCommand(conn, msg, from, pingCmd);
+                if (!ok) {
+                    await conn.sendMessage(from, { text: '🏓 Pong!' }, { quoted: msg });
+                }
                 return;
             }
 
-            // Category tap
+            // ========== CATEGORY TAP ==========
             if (isMenuTap) {
                 const cat = tappedId.replace('menu_', '');
                 const cmds = categorized[cat];
@@ -189,7 +241,7 @@ cmd({
                 return;
             }
 
-            // Reply-with-number fallback
+            // ========== REPLY-WITH-NUMBER FALLBACK ==========
             if (isReplyToOurs) {
                 const num = parseInt(tappedId);
                 if (num >= 1 && num <= categories.length) {
@@ -213,7 +265,7 @@ cmd({
 
         conn.ev.on('messages.upsert', listener);
 
-        // Cleanup after 60s
+        // 60s cleanup
         setTimeout(() => {
             conn.ev.off('messages.upsert', listener);
         }, 60000);
